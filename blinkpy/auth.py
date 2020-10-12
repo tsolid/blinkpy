@@ -6,7 +6,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from blinkpy import api
 from blinkpy.helpers import util
-from blinkpy.helpers.constants import BLINK_URL, LOGIN_ENDPOINT, TIMEOUT
+from blinkpy.helpers.constants import (
+    BLINK_URL,
+    DEFAULT_USER_AGENT,
+    LOGIN_ENDPOINT,
+    TIMEOUT,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,17 +58,22 @@ class Auth:
         """Return authorization header."""
         if self.token is None:
             return None
-        return {"Host": self.host, "TOKEN_AUTH": self.token}
+        return {"TOKEN_AUTH": self.token, "user-agent": DEFAULT_USER_AGENT}
 
-    def create_session(self):
+    def create_session(self, opts=None):
         """Create a session for blink communication."""
+        if opts is None:
+            opts = {}
+        backoff = opts.get("backoff", 1)
+        retries = opts.get("retries", 3)
+        retry_list = opts.get("retry_list", [429, 500, 502, 503, 504])
         sess = Session()
         assert_status_hook = [
             lambda response, *args, **kwargs: response.raise_for_status()
         ]
         sess.hooks["response"] = assert_status_hook
         retry = Retry(
-            total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]
+            total=retries, backoff_factor=backoff, status_forcelist=retry_list
         )
         adapter = HTTPAdapter(max_retries=retry)
         sess.mount("https://", adapter)
@@ -103,11 +113,7 @@ class Auth:
         try:
             _LOGGER.info("Token expired, attempting automatic refresh.")
             self.login_response = self.login()
-            self.region_id = self.login_response["region"]["tier"]
-            self.host = f"{self.region_id}.{BLINK_URL}"
-            self.token = self.login_response["authtoken"]["authtoken"]
-            self.client_id = self.login_response["client"]["id"]
-            self.account_id = self.login_response["account"]["id"]
+            self.extract_login_info()
             self.is_errored = False
         except LoginError:
             _LOGGER.error("Login endpoint failed. Try again later.")
@@ -116,6 +122,14 @@ class Auth:
             _LOGGER.error("Malformed login response: %s", self.login_response)
             raise TokenRefreshFailed
         return True
+
+    def extract_login_info(self):
+        """Extract login info from login response."""
+        self.region_id = self.login_response["region"]["tier"]
+        self.host = f"{self.region_id}.{BLINK_URL}"
+        self.token = self.login_response["authtoken"]["authtoken"]
+        self.client_id = self.login_response["client"]["id"]
+        self.account_id = self.login_response["account"]["id"]
 
     def startup(self):
         """Initialize tokens for communication."""
@@ -174,11 +188,18 @@ class Auth:
                 "Connection error. Endpoint %s possibly down or throttled.", url,
             )
         except BlinkBadResponse:
+            code = None
+            reason = None
+            try:
+                code = response.status_code
+                reason = response.reason
+            except AttributeError:
+                pass
             _LOGGER.error(
                 "Expected json response from %s, but received: %s: %s",
                 url,
-                response.status_code,
-                response.reason,
+                code,
+                reason,
             )
         except UnauthorizedError:
             try:

@@ -4,6 +4,56 @@ Changelog
 
 A list of changes between each release
 
+0.16.3 (2020-08-02)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Add user-agent to all headers
+
+0.16.2 (2020-08-01)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Add user-agent to header at login
+- Remove extra data parameters at login (not-needed)
+- Bump pytest to 6.0.1
+
+
+0.16.1 (2020-07-29)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Unpin requirements, set minimum version instead
+- Bump coverage to 5.2.1
+- Bump pytest to 6.0.0
+
+
+0.16.0 (2020-07-20)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Breaking Changes:**
+
+- Add arm property to camera, deprecate motion enable method (`#273 <https://github.com/fronzbot/blinkpy/pull/273>`__)
+- Complete refactoring of auth logic (breaks all pre-0.16.0 setups!) (`#261 <https://github.com/fronzbot/blinkpy/pull/261>`__)
+
+**New Features:**
+
+- Add is_errored property to Auth class (`#275 <https://github.com/fronzbot/blinkpy/pull/275>`__)
+- Add new endpoint to get user infor (`#280 <https://github.com/fronzbot/blinkpy/pull/280>`__)
+- Add get_liveview command to camera module (`#289 <https://github.com/fronzbot/blinkpy/pull/289>`__)
+- Add blink Mini Camera support (`#290 <https://github.com/fronzbot/blinkpy/pull/290>`__)
+- Add option to skip homescreen check (`#305 <https://github.com/fronzbot/blinkpy/pull/305>`__)
+- Add different timeout for video and image retrieval (`#323 <https://github.com/fronzbot/blinkpy/pull/323>`__)
+- Modifiy session to use HTTPAdapter and handle retries (`#324 <https://github.com/fronzbot/blinkpy/pull/324>`__)
+- Add retry option overrides (`#339 <https://github.com/fronzbot/blinkpy/pull/339>`__)
+
+**All changes:**
+
+Please see the change list in the (`Release Notes <https://github.com/fronzbot/releases/tag/v0.16.0>`__)
+
+
+0.15.1 (2020-07-11)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- Bugfix: remove "Host" from auth header (`#330 <https://github.com/fronzbot/blinkpy/pull/330>`__)
+
+
 0.15.0 (2020-05-08)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 **Breaking Changes:**
