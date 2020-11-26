@@ -5,71 +5,38 @@ import logging
 
 from blinkpy import blinkpy
 from blinkpy.sync_module import BlinkSyncModule
-from blinkpy.helpers.util import create_session, get_time
-import tests.mock_responses as mresp
-
-USERNAME = "foobar"
-PASSWORD = "deadbeef"
+from blinkpy.camera import BlinkCamera
+from blinkpy.helpers.util import get_time, BlinkURLHandler
 
 
 class MockSyncModule(BlinkSyncModule):
-    """Mock http requests from sync module."""
+    """Mock blink sync module object."""
 
-    def __init__(self, blink, header):
-        """Create mock sync module instance."""
-        super().__init__(blink, header, network_id=None, camera_list=None)
-        self.blink = blink
-        self.header = header
-        self.return_value = None
-        self.return_value2 = None
-
-    def http_get(self, url, stream=False, json=True):
-        """Mock get request."""
-        if stream and self.return_value2 is not None:
-            return self.return_value2
-        return self.return_value
-
-    def http_post(self, url):
-        """Mock post request."""
-        return self.return_value
+    def get_network_info(self):
+        """Mock network info method."""
+        return True
 
 
-@mock.patch("blinkpy.helpers.util.Session.send", side_effect=mresp.mocked_session_send)
+class MockCamera(BlinkCamera):
+    """Mock blink camera object."""
+
+    def update(self, config, force_cache=False, **kwargs):
+        """Mock camera update method."""
+
+
 class TestBlinkFunctions(unittest.TestCase):
     """Test Blink and BlinkCamera functions in blinkpy."""
 
     def setUp(self):
         """Set up Blink module."""
-        self.blink = blinkpy.Blink(username=USERNAME, password=PASSWORD)
-        # pylint: disable=protected-access
-        self.blink._auth_header = {"Host": "test.url.tld", "TOKEN_AUTH": "foobar123"}
-        self.blink.urls = blinkpy.BlinkURLHandler("test")
-        self.blink.session = create_session()
+        self.blink = blinkpy.Blink()
+        self.blink.urls = BlinkURLHandler("test")
 
     def tearDown(self):
         """Clean up after test."""
         self.blink = None
 
-    @mock.patch("blinkpy.login_handler.api.request_login")
-    def test_backup_url(self, req, mock_sess):
-        """Test backup login method."""
-        json_resp = {
-            "authtoken": {"authtoken": "foobar123"},
-            "networks": {"1234": {"name": "foobar", "onboarded": True}},
-        }
-        bad_req = mresp.MockResponse({}, 404)
-        new_req = mresp.MockResponse(json_resp, 200)
-        req.side_effect = [bad_req, bad_req, new_req]
-        self.blink.login_handler.login_urls = ["test1", "test2", "test3"]
-        self.blink.login_handler.login(self.blink)
-        self.assertEqual(self.blink.login_handler.login_url, "test3")
-
-        req.side_effect = [bad_req, new_req, bad_req]
-        self.blink.login_handler.login_urls = ["test1", "test2", "test3"]
-        self.blink.login_handler.login(self.blink)
-        self.assertEqual(self.blink.login_handler.login_url, "test2")
-
-    def test_merge_cameras(self, mock_sess):
+    def test_merge_cameras(self):
         """Test merge camera functionality."""
         first_dict = {"foo": "bar", "test": 123}
         next_dict = {"foobar": 456, "bar": "foo"}
@@ -82,7 +49,7 @@ class TestBlinkFunctions(unittest.TestCase):
         self.assertEqual(expected, result)
 
     @mock.patch("blinkpy.blinkpy.api.request_videos")
-    def test_download_video_exit(self, mock_req, mock_sess):
+    def test_download_video_exit(self, mock_req):
         """Test we exit method when provided bad response."""
         blink = blinkpy.Blink()
         # pylint: disable=protected-access
@@ -100,7 +67,7 @@ class TestBlinkFunctions(unittest.TestCase):
         self.assertEqual(dl_log.output, expected_log)
 
     @mock.patch("blinkpy.blinkpy.api.request_videos")
-    def test_parse_downloaded_items(self, mock_req, mock_sess):
+    def test_parse_downloaded_items(self, mock_req):
         """Test ability to parse downloaded items list."""
         blink = blinkpy.Blink()
         # pylint: disable=protected-access
@@ -125,7 +92,7 @@ class TestBlinkFunctions(unittest.TestCase):
         self.assertEqual(dl_log.output, expected_log)
 
     @mock.patch("blinkpy.blinkpy.api.request_videos")
-    def test_parse_camera_not_in_list(self, mock_req, mock_sess):
+    def test_parse_camera_not_in_list(self, mock_req):
         """Test ability to parse downloaded items list."""
         blink = blinkpy.Blink()
         # pylint: disable=protected-access
@@ -148,3 +115,16 @@ class TestBlinkFunctions(unittest.TestCase):
         with self.assertLogs() as dl_log:
             blink.download_videos("/tmp", camera="bar", stop=2)
         self.assertEqual(dl_log.output, expected_log)
+
+    @mock.patch("blinkpy.blinkpy.api.request_network_update")
+    @mock.patch("blinkpy.auth.Auth.query")
+    def test_refresh(self, mock_req, mock_update):
+        """Test ability to refresh system."""
+        mock_update.return_value = {"network": {"sync_module_error": False}}
+        mock_req.return_value = None
+        self.blink.last_refresh = 0
+        self.blink.available = True
+        self.blink.sync["foo"] = MockSyncModule(self.blink, "foo", 1, [])
+        self.blink.cameras = {"bar": MockCamera(self.blink.sync)}
+        self.blink.sync["foo"].cameras = self.blink.cameras
+        self.assertTrue(self.blink.refresh())
