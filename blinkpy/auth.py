@@ -1,15 +1,23 @@
 """Login handler for blink."""
+
+import time
+import uuid
 import logging
-from functools import partial
-from requests import Request, Session, exceptions
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from aiohttp import (
+    ClientSession,
+    ClientConnectionError,
+    ContentTypeError,
+    ClientResponse,
+)
 from blinkpy import api
 from blinkpy.helpers import util
+from blinkpy.helpers.pkce import generate_pkce_pair
 from blinkpy.helpers.constants import (
     BLINK_URL,
+    APP_BUILD,
     DEFAULT_USER_AGENT,
     LOGIN_ENDPOINT,
+    TIER_ENDPOINT,
     TIMEOUT,
 )
 
@@ -19,7 +27,15 @@ _LOGGER = logging.getLogger(__name__)
 class Auth:
     """Class to handle login communication."""
 
-    def __init__(self, login_data=None, no_prompt=False):
+    def __init__(
+        self,
+        login_data=None,
+        no_prompt=False,
+        session=None,
+        agent=DEFAULT_USER_AGENT,
+        app_build=APP_BUILD,
+        callback=None,
+    ):
         """
         Initialize auth handler.
 
@@ -28,29 +44,49 @@ class Auth:
                              - username
                              - password
         :param no_prompt: Should any user input prompts
-                          be supressed? True/FALSE
+                          be suppressed? True/FALSE
         """
         if login_data is None:
             login_data = {}
         self.data = login_data
         self.token = login_data.get("token", None)
+        self.expires_in = login_data.get("expires_in", None)
+        self.expiration_date = login_data.get("expiration_date", None)
+        self.refresh_token = login_data.get("refresh_token", None)
         self.host = login_data.get("host", None)
         self.region_id = login_data.get("region_id", None)
         self.client_id = login_data.get("client_id", None)
         self.account_id = login_data.get("account_id", None)
+        self.user_id = login_data.get("user_id", None)
         self.login_response = None
+        self.tier_info = None
         self.is_errored = False
         self.no_prompt = no_prompt
-        self.session = self.create_session()
+        self._agent = agent
+        self._app_build = app_build
+        self.session = session if session else ClientSession()
+
+        # Callback to notify on token refresh
+        self.callback = callback
+
+        # OAuth v2 attributes
+        self.hardware_id = login_data.get("hardware_id")
+        if not self.hardware_id:
+            self.hardware_id = str(uuid.uuid4()).upper()
 
     @property
     def login_attributes(self):
         """Return a dictionary of login attributes."""
         self.data["token"] = self.token
+        self.data["expires_in"] = self.expires_in
+        self.data["expiration_date"] = self.expiration_date
+        self.data["refresh_token"] = self.refresh_token
         self.data["host"] = self.host
         self.data["region_id"] = self.region_id
         self.data["client_id"] = self.client_id
         self.data["account_id"] = self.account_id
+        self.data["user_id"] = self.user_id
+        self.data["hardware_id"] = self.hardware_id
         return self.data
 
     @property
@@ -58,33 +94,12 @@ class Auth:
         """Return authorization header."""
         if self.token is None:
             return None
-        return {"TOKEN_AUTH": self.token, "user-agent": DEFAULT_USER_AGENT}
-
-    def create_session(self, opts=None):
-        """Create a session for blink communication."""
-        if opts is None:
-            opts = {}
-        backoff = opts.get("backoff", 1)
-        retries = opts.get("retries", 3)
-        retry_list = opts.get("retry_list", [429, 500, 502, 503, 504])
-        sess = Session()
-        assert_status_hook = [
-            lambda response, *args, **kwargs: response.raise_for_status()
-        ]
-        sess.hooks["response"] = assert_status_hook
-        retry = Retry(
-            total=retries, backoff_factor=backoff, status_forcelist=retry_list
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        sess.mount("https://", adapter)
-        sess.mount("http://", adapter)
-        sess.get = partial(sess.get, timeout=TIMEOUT)
-        return sess
-
-    def prepare_request(self, url, headers, data, reqtype):
-        """Prepare a request."""
-        req = Request(reqtype.upper(), url, headers=headers, data=data)
-        return req.prepare()
+        return {
+            # "APP-BUILD": self._app_build,
+            "Authorization": f"Bearer {self.token}",
+            # "User-Agent": self._agent,
+            "Content-Type": "application/json",
+        }
 
     def validate_login(self):
         """Check login information and prompt if not available."""
@@ -92,72 +107,134 @@ class Auth:
         self.data["password"] = self.data.get("password", None)
         if not self.no_prompt:
             self.data = util.prompt_login_data(self.data)
-
         self.data = util.validate_login_data(self.data)
 
-    def login(self, login_url=LOGIN_ENDPOINT):
-        """Attempt login to blink servers."""
+    async def login(self, login_url=LOGIN_ENDPOINT, refresh=False):
+        """Attempt OAuth login to blink servers."""
         self.validate_login()
-        _LOGGER.info("Attempting login with %s", login_url)
-        response = api.request_login(self, login_url, self.data, is_retry=False,)
+        response = await api.request_login(
+            self,
+            login_url,
+            self.data,
+            is_refresh=refresh,
+            is_retry=False,
+        )
         try:
-            if response.status_code == 200:
-                return response.json()
+            if response.status == 200:
+                return await response.json()
+            if response.status == 401:
+                _LOGGER.error(
+                    "Unable to refresh token. "
+                    "Invalid refresh token or invalid credentials."
+                )
+                raise UnauthorizedError
+            if response.status == 412:
+                raise BlinkTwoFARequiredError
             raise LoginError
-        except AttributeError:
-            raise LoginError
+        except AttributeError as error:
+            raise LoginError from error
 
-    def refresh_token(self):
-        """Refresh auth token."""
+    async def get_tier_info(self, tier_url=TIER_ENDPOINT):
+        """Get tier information."""
+        return await api.request_tier(self, tier_url)
+
+    def logout(self, blink):
+        """Log out."""
+        return api.request_logout(blink)
+
+    async def refresh_tokens(self, refresh=False):
+        """Create or refresh access token."""
         self.is_errored = True
         try:
-            _LOGGER.info("Token expired, attempting automatic refresh.")
-            self.login_response = self.login()
+            _LOGGER.info(
+                f"{'Refreshing' if refresh else 'Obtaining'} authentication token."
+            )
+            self.login_response = await self.login(refresh=refresh)
             self.extract_login_info()
+
+            if not refresh:
+                self.tier_info = await self.get_tier_info()
+                self.extract_tier_info()
+
             self.is_errored = False
-        except LoginError:
+        except BlinkTwoFARequiredError as error:
+            _LOGGER.error("Two-factor authentication required. Waiting for otp.")
+            raise BlinkTwoFARequiredError from error
+        except LoginError as error:
             _LOGGER.error("Login endpoint failed. Try again later.")
-            raise TokenRefreshFailed
-        except (TypeError, KeyError):
+            raise TokenRefreshFailed from error
+        except (TypeError, KeyError) as error:
             _LOGGER.error("Malformed login response: %s", self.login_response)
-            raise TokenRefreshFailed
+            raise TokenRefreshFailed from error
         return True
 
     def extract_login_info(self):
         """Extract login info from login response."""
-        self.region_id = self.login_response["region"]["tier"]
-        self.host = f"{self.region_id}.{BLINK_URL}"
-        self.token = self.login_response["authtoken"]["authtoken"]
-        self.client_id = self.login_response["client"]["id"]
-        self.account_id = self.login_response["account"]["id"]
+        self.token = self.login_response["access_token"]
+        self.expires_in = self.login_response["expires_in"]
+        self.expiration_date = time.time() + self.expires_in
+        self.refresh_token = self.login_response["refresh_token"]
 
-    def startup(self):
+    def extract_tier_info(self):
+        """Extract tier info from tier info response."""
+        self.region_id = self.tier_info["tier"]
+        self.host = f"{self.region_id}.{BLINK_URL}"
+        self.account_id = self.tier_info["account_id"]
+
+    async def startup(self):
         """Initialize tokens for communication."""
         self.validate_login()
-        if None in self.login_attributes.values():
-            self.refresh_token()
 
-    def validate_response(self, response, json_resp):
+        if self.refresh_token and self.hardware_id:
+            _LOGGER.debug("Attempting OAuth v2 token refresh")
+            try:
+                token_data = await api.oauth_refresh_token(
+                    self, self.refresh_token, self.hardware_id
+                )
+                if token_data:
+                    await self._process_token_data(token_data)
+                    _LOGGER.info("OAuth v2 token refresh successful")
+                    return
+            except Exception as error:
+                _LOGGER.debug("OAuth v2 refresh failed: %s", error)
+
+        _LOGGER.debug("Attempting OAuth v2 login flow")
+        success = await self._oauth_login_flow()
+        if success:
+            _LOGGER.info("OAuth v2 login successful")
+            return
+
+        raise LoginError("OAuth v2 login failed")
+
+    async def validate_response(self, response: ClientResponse, json_resp):
         """Check for valid response."""
         if not json_resp:
             self.is_errored = False
             return response
         self.is_errored = True
         try:
-            if response.status_code in [101, 401]:
+            if response.status in [101, 401]:
                 raise UnauthorizedError
-            if response.status_code == 404:
-                raise exceptions.ConnectionError
-            json_data = response.json()
-        except KeyError:
-            pass
-        except (AttributeError, ValueError):
-            raise BlinkBadResponse
+            if response.status == 404:
+                raise ClientConnectionError
+            json_data = await response.json()
+        except (AttributeError, ValueError) as error:
+            raise BlinkBadResponse from error
+        except ContentTypeError as error:
+            _LOGGER.warning("Got text for JSON response: %s", await response.text())
+            raise BlinkBadResponse from error
 
         self.is_errored = False
         return json_data
 
-    def query(
+    def need_refresh(self):
+        """Check if token needs refresh."""
+        if self.expiration_date is None:
+            return self.refresh_token is not None
+
+        return self.expiration_date - time.time() < 60
+
+    async def query(
         self,
         url=None,
         data=None,
@@ -167,9 +244,9 @@ class Auth:
         json_resp=True,
         is_retry=False,
         timeout=TIMEOUT,
+        skip_refresh_check=False,
     ):
-        """
-        Perform server requests.
+        """Perform server requests.
 
         :param url: URL to perform request
         :param data: Data to send
@@ -179,19 +256,37 @@ class Auth:
         :param json_resp: Return JSON response? TRUE/False
         :param is_retry: Is this part of a re-auth attempt? True/FALSE
         """
-        req = self.prepare_request(url, headers, data, reqtype)
         try:
-            response = self.session.send(req, stream=stream, timeout=timeout)
-            return self.validate_response(response, json_resp)
-        except (exceptions.ConnectionError, exceptions.Timeout):
+            if not skip_refresh_check and self.need_refresh():
+                await self.refresh_tokens(refresh=True)
+
+                if "Authorization" in headers:
+                    # update the authorization header with the new token
+                    headers["Authorization"] = f"Bearer {self.token}"
+
+                if self.callback is not None:
+                    self.callback()
+
+            if reqtype == "get":
+                response = await self.session.get(
+                    url=url, data=data, headers=headers, timeout=timeout
+                )
+            else:
+                response = await self.session.post(
+                    url=url, data=data, headers=headers, timeout=timeout
+                )
+            return await self.validate_response(response, json_resp)
+        except (ClientConnectionError, TimeoutError) as er:
             _LOGGER.error(
-                "Connection error. Endpoint %s possibly down or throttled.", url,
+                "Connection error. Endpoint %s possibly down or throttled. Error: %s",
+                url,
+                er,
             )
         except BlinkBadResponse:
             code = None
             reason = None
             try:
-                code = response.status_code
+                code = response.status
                 reason = response.reason
             except AttributeError:
                 pass
@@ -201,45 +296,137 @@ class Auth:
                 code,
                 reason,
             )
-        except UnauthorizedError:
-            try:
-                if not is_retry:
-                    self.refresh_token()
-                    return self.query(
-                        url=url,
-                        data=data,
-                        headers=self.header,
-                        reqtype=reqtype,
-                        stream=stream,
-                        json_resp=json_resp,
-                        is_retry=True,
-                        timeout=timeout,
-                    )
-                _LOGGER.error("Unable to access %s after token refresh.", url)
-            except TokenRefreshFailed:
-                _LOGGER.error("Unable to refresh token.")
         return None
 
-    def send_auth_key(self, blink, key):
-        """Send 2FA key to blink servers."""
-        if key is not None:
-            response = api.request_verify(self, blink, key)
-            try:
-                json_resp = response.json()
-                blink.available = json_resp["valid"]
-            except (KeyError, TypeError):
-                _LOGGER.error("Did not receive valid response from server.")
-                return False
+    async def _oauth_login_flow(self):
+        """
+        Execute complete OAuth 2.0 login flow with PKCE.
+
+        Returns:
+            bool: True if successful
+
+        """
+        # Step 1: Generate PKCE
+        code_verifier, code_challenge = generate_pkce_pair()
+
+        # Step 2: Authorization request
+        auth_success = await api.oauth_authorize_request(
+            self, self.hardware_id, code_challenge
+        )
+        if not auth_success:
+            _LOGGER.error("OAuth authorization request failed")
+            return False
+
+        # Step 3: Get CSRF token
+        csrf_token = await api.oauth_get_signin_page(self)
+        if not csrf_token:
+            _LOGGER.error("Failed to get CSRF token")
+            return False
+
+        # Step 4: Login
+        email = self.data.get("username")
+        password = self.data.get("password")
+
+        login_result = await api.oauth_signin(self, email, password, csrf_token)
+
+        # Step 4b: Handle 2FA if needed
+        if login_result == "2FA_REQUIRED":
+            # Store CSRF token and verifier for later use
+            self._oauth_csrf_token = csrf_token
+            self._oauth_code_verifier = code_verifier
+            # Raise exception to let the app handle 2FA prompt
+            _LOGGER.info("Two-factor authentication required.")
+            raise BlinkTwoFARequiredError
+        elif login_result != "SUCCESS":
+            _LOGGER.error("Login failed")
+            return False
+
+        # Step 5: Get authorization code
+        code = await api.oauth_get_authorization_code(self)
+        if not code:
+            _LOGGER.error("Failed to get authorization code")
+            return False
+
+        # Step 6: Exchange code for token
+        token_data = await api.oauth_exchange_code_for_token(
+            self, code, code_verifier, self.hardware_id
+        )
+
+        if not token_data:
+            _LOGGER.error("Failed to exchange code for token")
+            return False
+
+        # Process tokens
+        await self._process_token_data(token_data)
         return True
 
-    def check_key_required(self):
-        """Check if 2FA key is required."""
-        try:
-            if self.login_response["client"]["verification_required"]:
-                return True
-        except (KeyError, TypeError):
-            pass
-        return False
+    async def _process_token_data(self, token_data):
+        """Process token response data."""
+        self.token = token_data.get("access_token")
+        self.refresh_token = token_data.get("refresh_token")
+
+        # Set expiration
+        expires_in = token_data.get("expires_in", 3600)
+        self.expires_in = expires_in
+        self.expiration_date = time.time() + expires_in
+
+        # Get tier info if needed (for account_id, region_id, host)
+        if not self.host or not self.region_id or not self.account_id:
+            try:
+                self.tier_info = await self.get_tier_info()
+                self.extract_tier_info()
+            except Exception as error:
+                _LOGGER.warning("Failed to get tier info: %s", error)
+
+    async def complete_2fa_login(self, twofa_code):
+        """
+        Complete OAuth v2 login after 2FA verification.
+
+        Args:
+            twofa_code: 2FA code from user
+
+        Returns:
+            bool: True if successful
+
+        """
+        # Check if we have stored OAuth state
+        if not hasattr(self, "_oauth_csrf_token") or not hasattr(
+            self, "_oauth_code_verifier"
+        ):
+            _LOGGER.error("No OAuth 2FA state found. Start login flow first.")
+            return False
+
+        csrf_token = self._oauth_csrf_token
+        code_verifier = self._oauth_code_verifier
+
+        # Verify 2FA
+        if not await api.oauth_verify_2fa(self, csrf_token, twofa_code):
+            _LOGGER.error("2FA verification failed")
+            return False
+
+        # Step 5: Get authorization code
+        code = await api.oauth_get_authorization_code(self)
+        if not code:
+            _LOGGER.error("Failed to get authorization code after 2FA")
+            return False
+
+        # Step 6: Exchange code for token
+        token_data = await api.oauth_exchange_code_for_token(
+            self, code, code_verifier, self.hardware_id
+        )
+
+        if not token_data:
+            _LOGGER.error("Failed to exchange code for token after 2FA")
+            return False
+
+        # Process tokens
+        await self._process_token_data(token_data)
+
+        # Clean up temporary state
+        delattr(self, "_oauth_csrf_token")
+        delattr(self, "_oauth_code_verifier")
+
+        return True
 
 
 class TokenRefreshFailed(Exception):
@@ -252,6 +439,10 @@ class LoginError(Exception):
 
 class BlinkBadResponse(Exception):
     """Class to throw bad json response exception."""
+
+
+class BlinkTwoFARequiredError(Exception):
+    """Class to throw two-factor authentication required exception."""
 
 
 class UnauthorizedError(Exception):
